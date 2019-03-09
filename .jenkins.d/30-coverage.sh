@@ -9,7 +9,7 @@ set -x
 if [[ $JOB_NAME == *"code-coverage" ]]; then
     gcovr --object-directory=build \
           --output=build/coverage.xml \
-          --filter="$PWD/src" \
+          --exclude="$PWD/(examples|tests)" \
           --root=. \
           --xml
 

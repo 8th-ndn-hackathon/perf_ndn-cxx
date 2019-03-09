@@ -3,7 +3,7 @@
 from waflib import Context, Logs, Utils
 import os, subprocess
 
-VERSION = '0.6.3'
+VERSION = '0.6.5'
 APPNAME = 'ndn-cxx'
 PACKAGE_BUGREPORT = 'https://redmine.named-data.net/projects/ndn-cxx'
 PACKAGE_URL = 'http://named-data.net/doc/ndn-cxx/'
@@ -17,25 +17,7 @@ def options(opt):
               'doxygen', 'sphinx_build'],
              tooldir=['.waf-tools'])
 
-    opt = opt.add_option_group('Library Options')
-
-    opt.add_option('--with-examples', action='store_true', default=False,
-                   help='Build examples')
-
-    opt.add_option('--with-tests', action='store_true', default=False,
-                   help='Build unit tests')
-
-    opt.add_option('--without-tools', action='store_false', default=True, dest='with_tools',
-                   help='Do not build tools')
-
-    opt.add_option('--without-sqlite-locking', action='store_false', default=True,
-                   dest='with_sqlite_locking',
-                   help='Disable filesystem locking in sqlite3 database '
-                        '(use unix-dot locking mechanism instead). '
-                        'This option may be necessary if the home directory is hosted on NFS.')
-
-    opt.add_option('--without-osx-keychain', action='store_false', default=True,
-                   dest='with_osx_keychain', help='Do not use macOS Keychain as default TPM (macOS only)')
+    opt = opt.add_option_group('ndn-cxx Options')
 
     opt.add_option('--enable-static', action='store_true', default=False,
                    dest='enable_static', help='Build static library (disabled by default)')
@@ -46,6 +28,30 @@ def options(opt):
                    dest='enable_shared', help='Build shared library (enabled by default)')
     opt.add_option('--disable-shared', action='store_false', default=True,
                    dest='enable_shared', help='Do not build shared library (enabled by default)')
+
+    opt.add_option('--without-osx-keychain', action='store_false', default=True,
+                   dest='with_osx_keychain', help='Do not use macOS Keychain as default TPM (macOS only)')
+
+    opt.add_option('--without-sqlite-locking', action='store_false', default=True, dest='with_sqlite_locking',
+                   help='Disable filesystem locking in sqlite3 database '
+                        '(use unix-dot locking mechanism instead). '
+                        'This option may be necessary if the home directory is hosted on NFS.')
+
+    stacktrace_choices = ['backtrace', 'addr2line', 'basic', 'noop']
+    opt.add_option('--with-stacktrace', action='store', default=None, choices=stacktrace_choices,
+                   help='Select the stacktrace backend implementation: '
+                        '%s [default=auto-detect]' % ', '.join(stacktrace_choices))
+    opt.add_option('--without-stacktrace', action='store_const', const='', dest='with_stacktrace',
+                   help='Disable stacktrace support')
+
+    opt.add_option('--with-examples', action='store_true', default=False,
+                   help='Build examples')
+
+    opt.add_option('--with-tests', action='store_true', default=False,
+                   help='Build tests')
+
+    opt.add_option('--without-tools', action='store_false', default=True, dest='with_tools',
+                   help='Do not build tools')
 
 def configure(conf):
     conf.start_msg('Building static library')
@@ -70,11 +76,11 @@ def configure(conf):
                'pch', 'osx-frameworks', 'boost', 'openssl', 'sqlite3',
                'doxygen', 'sphinx_build'])
 
-    conf.env['WITH_TESTS'] = conf.options.with_tests
-    conf.env['WITH_TOOLS'] = conf.options.with_tools
-    conf.env['WITH_EXAMPLES'] = conf.options.with_examples
+    conf.env.WITH_TESTS = conf.options.with_tests
+    conf.env.WITH_TOOLS = conf.options.with_tools
+    conf.env.WITH_EXAMPLES = conf.options.with_examples
 
-    conf.find_program('sh', var='SH', mandatory=True)
+    conf.find_program('sh', var='SH')
 
     conf.check_cxx(lib='pthread', uselib_store='PTHREAD', define_name='HAVE_PTHREAD', mandatory=False)
     conf.check_cxx(lib='rt', uselib_store='RT', define_name='HAVE_RT', mandatory=False)
@@ -85,7 +91,7 @@ def configure(conf):
     if conf.check_cxx(msg='Checking for netlink', define_name='HAVE_NETLINK', mandatory=False,
                       header_name=['linux/if_addr.h', 'linux/if_link.h',
                                    'linux/netlink.h', 'linux/rtnetlink.h', 'linux/genetlink.h']):
-        conf.env['HAVE_NETLINK'] = True
+        conf.env.HAVE_NETLINK = True
         conf.check_cxx(msg='Checking for NETLINK_EXT_ACK', define_name='HAVE_NETLINK_EXT_ACK', mandatory=False,
                        fragment='''#include <linux/netlink.h>
                                    int main() { return NETLINK_EXT_ACK; }''')
@@ -94,60 +100,65 @@ def configure(conf):
                                    int main() { return IFA_FLAGS; }''')
 
     conf.check_osx_frameworks()
+    conf.check_sqlite3()
+    conf.check_openssl(lib='crypto', atleast_version=0x1000200f) # 1.0.2
 
-    conf.check_sqlite3(mandatory=True)
-    conf.check_openssl(mandatory=True, atleast_version=0x1000200f) # 1.0.2
+    boost_libs = ['system', 'program_options', 'chrono', 'date_time', 'filesystem', 'thread', 'log']
 
-    USED_BOOST_LIBS = ['system', 'filesystem', 'date_time', 'iostreams',
-                       'program_options', 'chrono', 'thread', 'log', 'log_setup']
+    stacktrace_backend = conf.options.with_stacktrace
+    if stacktrace_backend is None:
+        # auto-detect
+        for candidate in ['backtrace', 'basic']:
+            try:
+                conf.check_boost(lib='stacktrace_%s' % candidate, mt=True)
+            except conf.errors.ConfigurationError:
+                continue
+            stacktrace_backend = candidate
+            break
+    if stacktrace_backend:
+        conf.env.HAVE_STACKTRACE = True
+        conf.env.append_unique('DEFINES_BOOST', ['BOOST_STACKTRACE_DYN_LINK'])
+        boost_libs.append('stacktrace_%s' % stacktrace_backend)
 
-    if conf.env['WITH_TESTS']:
-        USED_BOOST_LIBS += ['unit_test_framework']
-        conf.define('HAVE_TESTS', 1)
+    if conf.env.WITH_TESTS:
+        boost_libs.append('unit_test_framework')
 
-    conf.check_boost(lib=USED_BOOST_LIBS, mandatory=True, mt=True)
+    conf.check_boost(lib=boost_libs, mt=True)
     if conf.env.BOOST_VERSION_NUMBER < 105800:
         conf.fatal('Minimum required Boost version is 1.58.0\n'
                    'Please upgrade your distribution or manually install a newer version of Boost'
                    ' (https://redmine.named-data.net/projects/nfd/wiki/Boost_FAQ)')
 
-    if not conf.options.with_sqlite_locking:
-        conf.define('DISABLE_SQLITE3_FS_LOCKING', 1)
-
-    if conf.env['HAVE_OSX_FRAMEWORKS']:
-        conf.env['WITH_OSX_KEYCHAIN'] = conf.options.with_osx_keychain
-        if conf.options.with_osx_keychain:
-            conf.define('WITH_OSX_KEYCHAIN', 1)
-    else:
-        conf.env['WITH_OSX_KEYCHAIN'] = False
-
     conf.check_compiler_flags()
 
     # Loading "late" to prevent tests from being compiled with profiling flags
     conf.load('coverage')
-
     conf.load('sanitizers')
-
-    conf.define('SYSCONFDIR', conf.env['SYSCONFDIR'])
 
     if not conf.env.enable_static:
         # If there happens to be a static library, waf will put the corresponding -L flags
         # before dynamic library flags.  This can result in compilation failure when the
         # system has a different version of the ndn-cxx library installed.
-        conf.env['STLIBPATH'] = ['.'] + conf.env['STLIBPATH']
+        conf.env.prepend_value('STLIBPATH', ['.'])
 
-    # config file will contain all defines that were added using conf.define('xxx'...)
-    # Everything that was added directly to conf.env['DEFINES'] will not appear in the
-    # config file and will be added using compiler directives in the command line.
-    conf.write_config_header('src/ndn-cxx-config.hpp', define_prefix='NDN_CXX_')
+    conf.define_cond('HAVE_STACKTRACE', conf.env.HAVE_STACKTRACE)
+    conf.define_cond('HAVE_TESTS', conf.env.WITH_TESTS)
+    conf.define_cond('WITH_OSX_KEYCHAIN', conf.env.HAVE_OSX_FRAMEWORKS and conf.options.with_osx_keychain)
+    conf.define_cond('DISABLE_SQLITE3_FS_LOCKING', not conf.options.with_sqlite_locking)
+    conf.define('SYSCONFDIR', conf.env.SYSCONFDIR)
+    # The config header will contain all defines that were added using conf.define()
+    # or conf.define_cond().  Everything that was added directly to conf.env.DEFINES
+    # will not appear in the config header, but will instead be passed directly to the
+    # compiler on the command line.
+    conf.write_config_header('ndn-cxx/detail/config.hpp', define_prefix='NDN_CXX_')
 
 def build(bld):
     version(bld)
 
     bld(features='subst',
         name='version.hpp',
-        source='src/version.hpp.in',
-        target='src/version.hpp',
+        source='ndn-cxx/version.hpp.in',
+        target='ndn-cxx/version.hpp',
         install_path=None,
         VERSION_STRING=VERSION_BASE,
         VERSION_BUILD=VERSION,
@@ -158,37 +169,36 @@ def build(bld):
         VERSION_MINOR=VERSION_SPLIT[1],
         VERSION_PATCH=VERSION_SPLIT[2])
 
-    if bld.env['HAVE_OSX_FRAMEWORKS']:
+    if bld.env.HAVE_OSX_FRAMEWORKS:
         # Need to disable precompiled headers for Objective-C++ code
         bld(features=['cxx'],
-            target='ndn-cxx-mm',
-            name='ndn-cxx-mm',
-            source=bld.path.ant_glob(['src/**/*-osx.mm']),
-            use='version BOOST OPENSSL SQLITE3 RT PTHREAD OSX_COREFOUNDATION OSX_SECURITY OSX_SYSTEMCONFIGURATION OSX_FOUNDATION OSX_COREWLAN',
-            includes='src')
+            target='ndn-cxx-mm-objects',
+            source=bld.path.ant_glob('ndn-cxx/**/*-osx.mm'),
+            use='BOOST PTHREAD OSX_COREFOUNDATION OSX_SECURITY OSX_SYSTEMCONFIGURATION OSX_FOUNDATION OSX_COREWLAN',
+            includes='.')
 
     libndn_cxx = dict(
         target='ndn-cxx',
-        source=bld.path.ant_glob('src/**/*.cpp',
-                                 excl=['src/**/*-osx.cpp',
-                                       'src/**/*netlink*.cpp',
-                                       'src/**/*-sqlite3.cpp']),
+        source=bld.path.ant_glob('ndn-cxx/**/*.cpp',
+                                 excl=['ndn-cxx/**/*-osx.cpp',
+                                       'ndn-cxx/**/*netlink*.cpp',
+                                       'ndn-cxx/**/*-sqlite3.cpp']),
         features='pch',
-        headers='src/common-pch.hpp',
-        use='version ndn-cxx-mm BOOST OPENSSL SQLITE3 RT PTHREAD',
-        includes='. src',
-        export_includes='src',
+        headers='ndn-cxx/impl/common-pch.hpp',
+        use='ndn-cxx-mm-objects version BOOST OPENSSL SQLITE3 RT PTHREAD',
+        includes='.',
+        export_includes='.',
         install_path='${LIBDIR}')
 
-    if bld.env['HAVE_OSX_FRAMEWORKS']:
-        libndn_cxx['source'] += bld.path.ant_glob('src/**/*-osx.cpp')
+    if bld.env.HAVE_OSX_FRAMEWORKS:
+        libndn_cxx['source'] += bld.path.ant_glob('ndn-cxx/**/*-osx.cpp')
         libndn_cxx['use'] += ' OSX_COREFOUNDATION OSX_SECURITY OSX_SYSTEMCONFIGURATION OSX_FOUNDATION OSX_COREWLAN'
 
-    if bld.env['HAVE_NETLINK']:
-        libndn_cxx['source'] += bld.path.ant_glob('src/**/*netlink*.cpp')
+    if bld.env.HAVE_NETLINK:
+        libndn_cxx['source'] += bld.path.ant_glob('ndn-cxx/**/*netlink*.cpp')
 
     # In case we want to make it optional later
-    libndn_cxx['source'] += bld.path.ant_glob('src/**/*-sqlite3.cpp')
+    libndn_cxx['source'] += bld.path.ant_glob('ndn-cxx/**/*-sqlite3.cpp')
 
     if bld.env.enable_shared:
         bld.shlib(name='ndn-cxx',
@@ -206,6 +216,7 @@ def build(bld):
     pkgconfig_linkflags = []
     pkgconfig_includes = []
     pkgconfig_cxxflags = []
+    pkgconfig_defines = []
     for lib in Utils.to_list(libndn_cxx['use']):
         if bld.env['LIB_%s' % lib]:
             pkgconfig_libs += Utils.to_list(bld.env['LIB_%s' % lib])
@@ -217,9 +228,11 @@ def build(bld):
             pkgconfig_linkflags += Utils.to_list(bld.env['LINKFLAGS_%s' % lib])
         if bld.env['CXXFLAGS_%s' % lib]:
             pkgconfig_cxxflags += Utils.to_list(bld.env['CXXFLAGS_%s' % lib])
+        if bld.env['DEFINES_%s' % lib]:
+            pkgconfig_defines += Utils.to_list(bld.env['DEFINES_%s' % lib])
 
     EXTRA_FRAMEWORKS = ''
-    if bld.env['HAVE_OSX_FRAMEWORKS']:
+    if bld.env.HAVE_OSX_FRAMEWORKS:
         EXTRA_FRAMEWORKS = '-framework CoreFoundation -framework Security -framework SystemConfiguration -framework Foundation -framework CoreWLAN'
 
     def uniq(alist):
@@ -238,41 +251,39 @@ def build(bld):
          EXTRA_LDFLAGS=' '.join([('-L%s' % i) for i in uniq(pkgconfig_ldflags)]),
          EXTRA_LINKFLAGS=' '.join(uniq(pkgconfig_linkflags)),
          EXTRA_INCLUDES=' '.join([('-I%s' % i) for i in uniq(pkgconfig_includes)]),
-         EXTRA_CXXFLAGS=' '.join(uniq(pkgconfig_cxxflags)),
+         EXTRA_CXXFLAGS=' '.join(uniq(pkgconfig_cxxflags)) + ' ' + ' '.join([('-D%s' % i) for i in uniq(pkgconfig_defines)]),
          EXTRA_FRAMEWORKS=EXTRA_FRAMEWORKS)
 
-    if bld.env['WITH_TESTS']:
+    if bld.env.WITH_TESTS:
         bld.recurse('tests')
 
-    if bld.env['WITH_TOOLS']:
+    if bld.env.WITH_TOOLS:
         bld.recurse('tools')
 
-    if bld.env['WITH_EXAMPLES']:
+    if bld.env.WITH_EXAMPLES:
         bld.recurse('examples')
 
-    headers = bld.path.ant_glob('src/**/*.hpp',
-                                excl=['src/**/*-osx.hpp',
-                                      'src/**/*netlink*.hpp',
-                                      'src/**/*-sqlite3.hpp',
-                                      'src/**/detail/**/*'])
+    headers = bld.path.ant_glob('ndn-cxx/**/*.hpp',
+                                excl=['ndn-cxx/**/*-osx.hpp',
+                                      'ndn-cxx/**/*netlink*.hpp',
+                                      'ndn-cxx/**/*-sqlite3.hpp',
+                                      'ndn-cxx/**/impl/**/*'])
 
-    if bld.env['HAVE_OSX_FRAMEWORKS']:
-        headers += bld.path.ant_glob('src/**/*-osx.hpp', excl='src/**/detail/**/*')
+    if bld.env.HAVE_OSX_FRAMEWORKS:
+        headers += bld.path.ant_glob('ndn-cxx/**/*-osx.hpp', excl='ndn-cxx/**/impl/**/*')
 
-    if bld.env['HAVE_NETLINK']:
-        headers += bld.path.ant_glob('src/**/*netlink*.hpp', excl='src/**/detail/**/*')
+    if bld.env.HAVE_NETLINK:
+        headers += bld.path.ant_glob('ndn-cxx/**/*netlink*.hpp', excl='ndn-cxx/**/impl/**/*')
 
     # In case we want to make it optional later
-    headers += bld.path.ant_glob('src/**/*-sqlite3.hpp', excl='src/**/detail/**/*')
+    headers += bld.path.ant_glob('ndn-cxx/**/*-sqlite3.hpp', excl='ndn-cxx/**/impl/**/*')
 
-    bld.install_files('%s/ndn-cxx' % bld.env['INCLUDEDIR'], headers,
-                      relative_trick=True, cwd=bld.path.find_node('src'))
+    bld.install_files(bld.env.INCLUDEDIR, headers, relative_trick=True)
 
-    bld.install_files('%s/ndn-cxx' % bld.env['INCLUDEDIR'],
-                      bld.path.find_resource('src/ndn-cxx-config.hpp'))
-
-    bld.install_files('%s/ndn-cxx' % bld.env['INCLUDEDIR'],
-                      bld.path.find_resource('src/version.hpp'))
+    # Install generated headers
+    for filename in ['ndn-cxx/detail/config.hpp', 'ndn-cxx/version.hpp']:
+        bld.install_files('%s/%s' % (bld.env.INCLUDEDIR, os.path.dirname(filename)),
+                          bld.path.find_resource(filename))
 
     bld.install_files('${SYSCONFDIR}/ndn', 'client.conf.sample')
 
